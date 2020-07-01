@@ -18,12 +18,14 @@
 #include <memory>
 #include <set>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "common.h"
+#include "normalizer.h"
+#include "sentencepiece_model.pb.h"
 #include "sentencepiece_processor.h"
+#include "third_party/absl/container/flat_hash_map.h"
 #include "third_party/absl/strings/string_view.h"
 #include "third_party/darts_clone/darts.h"
 #include "util.h"
@@ -31,44 +33,32 @@
 namespace sentencepiece {
 
 // "_this_is_a_pen" => ["_this", "_is", "_a", "_pen"]
-std::vector<absl::string_view> SplitIntoWords(absl::string_view text);
+std::vector<absl::string_view> SplitIntoWords(absl::string_view text,
+                                              bool add_ws_as_suffix = false);
+
+// Converts byte (0-255) to piece (e.g., 58 -> "<0x3A>").
+std::string ByteToPiece(unsigned char c);
+
+// Converts piece to byte (e.g., "<0x3A>" -> 58). Returns -1 if `piece` is not
+// a valid byte piece.
+int PieceToByte(absl::string_view piece);
 
 using EncodeResult = std::vector<std::pair<absl::string_view, int>>;
 using NBestEncodeResult = std::vector<std::pair<EncodeResult, float>>;
 
 class ModelProto;
 
-// Given a list of strings, finds the longest string which is a
-// prefix of a query.
-class PrefixMatcher {
- public:
-  // Initializes the PrefixMatcher with `dic`.
-  explicit PrefixMatcher(const std::set<absl::string_view> &dic);
-
-  // Finds the longest string in dic, which is a prefix of `w`.
-  // Returns the UTF8 byte length of matched string.
-  // `found` is set if a prefix match exists.
-  // If no entry is found, consumes one Unicode character.
-  int PrefixMatch(absl::string_view w, bool *found = nullptr) const;
-
-  // Replaces entries in `w` with `out`.
-  std::string GlobalReplace(absl::string_view w, absl::string_view out) const;
-
- private:
-  std::unique_ptr<Darts::DoubleArray> trie_;
-};
-
 // Underlying model interface.
 // Given a normalized string, returns a sequence of sentence pieces with ids.
 class ModelInterface {
  public:
-  using PieceToIdMap =
-      std::unordered_map<absl::string_view, int, string_util::string_view_hash>;
+  using PieceToIdMap = absl::flat_hash_map<absl::string_view, int,
+                                           string_util::string_view_hash>;
 
-  static const char *kUNK();
-  static const char *kBOS();
-  static const char *kEOS();
-  static const char *kPAD();
+  absl::string_view unk_piece() const;
+  absl::string_view bos_piece() const;
+  absl::string_view eos_piece() const;
+  absl::string_view pad_piece() const;
 
   // `model_proto` should not be deleted until ModelInterface is destroyed.
   explicit ModelInterface(const ModelProto &model_proto);
@@ -81,6 +71,23 @@ class ModelInterface {
   virtual util::Status status() const { return status_; }
 
   virtual const ModelProto &model_proto() const { return *model_proto_; }
+
+  virtual const normalizer::PrefixMatcher *prefix_matcher() const {
+    return matcher_.get();
+  }
+
+  // Sets the encoder version. Currently only unigram has an optimized encoder.
+  // The optimized version is always used by default if there is one, so
+  // normally users do not need to call this function. This function is provided
+  // just in case that a user want to manually choose which encoder version to
+  // use.
+  virtual util::Status SetEncoderVersion(EncoderVersion encoder_version) {
+    encoder_version_ = encoder_version;
+    return util::OkStatus();
+  }
+
+  // Returns the current encoder version in use.
+  virtual EncoderVersion GetEncoderVersion() const { return encoder_version_; }
 
   // Given a normalized string, returns a sequence of sentence pieces with ids.
   // The concatenation of pieces must be the same as `normalized`.
@@ -99,9 +106,11 @@ class ModelInterface {
     return EncodeResult();
   }
 
-  // Returns the size of sentence pieces, which is the same
-  // as the size of vocabulary for NMT.
-  virtual int GetPieceSize() const;
+  // Return true if SampleEncode returns a valid result.
+  virtual bool IsSampleEncodeAvailable() const { return false; }
+
+  // Return true if NBestEncode returns a valid result.
+  virtual bool IsNBestEncodeAvailable() const { return false; }
 
   // Returns the vocab id of `piece`.
   // Returns UNK(0) if `piece` is unknown
@@ -109,41 +118,113 @@ class ModelInterface {
 
   // Returns the string representation of vocab with `id`.
   // id must be 0 <= id < GetPieceSize().
-  virtual std::string IdToPiece(int id) const;
+  virtual const std::string &IdToPiece(int id) const {
+    return model_proto_->pieces(id).piece();
+  }
+
+  // Returns the size of sentence pieces, which is the same
+  // as the size of vocabulary for NMT.
+  virtual int GetPieceSize() const { return model_proto_->pieces_size(); }
 
   // Returns the score of `id`.
   // Score represents a log probability of the piece.
   // We can roughly estimate the unigram frequency of the piece.
-  virtual float GetScore(int id) const;
+  virtual float GetScore(int id) const {
+    return model_proto_->pieces(id).score();
+  }
 
   // Returns true if `id` is unknown symbol.
-  virtual bool IsUnknown(int id) const;
+  virtual bool IsUnknown(int id) const {
+    return (model_proto_->pieces(id).type() ==
+            ModelProto::SentencePiece::UNKNOWN);
+  }
 
   // Returns true if `id` is control symbol.
-  virtual bool IsControl(int id) const;
+  virtual bool IsControl(int id) const {
+    return (model_proto_->pieces(id).type() ==
+            ModelProto::SentencePiece::CONTROL);
+  }
 
   // Returns true if `id` is unused symbol.
-  virtual bool IsUnused(int id) const;
+  virtual bool IsUnused(int id) const {
+    return (model_proto_->pieces(id).type() ==
+            ModelProto::SentencePiece::UNUSED);
+  }
 
   // Returns true if `id` is user defined symbol.
-  virtual bool IsUserDefined(int id) const;
+  virtual bool IsUserDefined(int id) const {
+    return (model_proto_->pieces(id).type() ==
+            ModelProto::SentencePiece::USER_DEFINED);
+  }
+
+  // Returns true if `id` is byte symbol.
+  virtual bool IsByte(int id) const {
+    return (model_proto_->pieces(id).type() == ModelProto::SentencePiece::BYTE);
+  }
+
+  virtual bool ByteFallbackEnabled() const {
+    return model_proto_ && model_proto_->trainer_spec().byte_fallback();
+  }
+
+  // Verifies if the `expected` and `actual` outputs are equivalent. `expected`
+  // and `actual` are sentence pieces joined by space (` `). Normally it means
+  // that the two strings are identical. In some model, due to float rounding
+  // errors, the strings may not be identical, but they may be still equivalent
+  // provided their scores are close enough (by some espilon).
+  virtual bool VerifyOutputsEquivalent(absl::string_view expected,
+                                       absl::string_view actual) const {
+    return expected == actual;
+  }
 
  protected:
-  void InitializePieces(bool use_prefix_matcher);
+  void InitializePieces();
+
+  // Non-virtual (inlined) implementation for faster execution.
+  inline float GetScoreInlined(int id) const {
+    return model_proto_->pieces(id).score();
+  }
+
+  inline bool IsUnknownInlined(int id) const {
+    return (model_proto_->pieces(id).type() ==
+            ModelProto::SentencePiece::UNKNOWN);
+  }
+
+  inline bool IsControlInlined(int id) const {
+    return (model_proto_->pieces(id).type() ==
+            ModelProto::SentencePiece::CONTROL);
+  }
+
+  inline bool IsUnusedInlined(int id) const {
+    return (model_proto_->pieces(id).type() ==
+            ModelProto::SentencePiece::UNUSED);
+  }
+
+  inline bool IsUserDefinedInlined(int id) const {
+    return (model_proto_->pieces(id).type() ==
+            ModelProto::SentencePiece::USER_DEFINED);
+  }
+
+  inline bool IsByteInlined(int id) const {
+    return (model_proto_->pieces(id).type() == ModelProto::SentencePiece::BYTE);
+  }
 
   const ModelProto *model_proto_ = nullptr;
 
   // PrefixMatcher for user defined symbols.
-  std::unique_ptr<PrefixMatcher> matcher_;
+  std::unique_ptr<normalizer::PrefixMatcher> matcher_;
 
   // piece -> id map for normal pieces
   PieceToIdMap pieces_;
 
-  // piece -> id map for control and unknown
+  // piece -> id map for control, unknown, and byte pieces
   PieceToIdMap reserved_id_map_;
 
   // unknown id.
   int unk_id_ = 0;
+
+  // The encoder version. Currently it is only effective for unigram model but
+  // ignored by other models.
+  EncoderVersion encoder_version_ = EncoderVersion::kOptimized;
 
   // status.
   util::Status status_;

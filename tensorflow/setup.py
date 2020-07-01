@@ -16,6 +16,7 @@
 
 from setuptools import setup
 from setuptools import find_packages
+import tensorflow as tf
 import codecs
 import string
 import sys
@@ -35,7 +36,7 @@ setup(name = 'tf_sentencepiece',
       license = 'Apache',
       platforms = 'Unix',
       packages=find_packages(exclude=['test']),
-      package_data={'tf_sentencepiece':  ['_sentencepiece_processor_ops.so']},
+      package_data={'tf_sentencepiece':  ['_sentencepiece_processor_ops.so*']},
       classifiers = [
         'Development Status :: 5 - Production/Stable',
         'Environment :: Console',

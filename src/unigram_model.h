@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "common.h"
+#include "freelist.h"
 #include "model_interface.h"
 #include "sentencepiece_model.pb.h"
 #include "third_party/darts_clone/darts.h"
@@ -35,14 +36,14 @@ class Lattice {
   virtual ~Lattice();
 
   struct Node {
-    absl::string_view piece;      // Sentence piece representation.
-    uint32 pos;             // Unicode position in the sentence.
-    uint32 length;          // Unicode length, not UT8 byte.
-    uint32 node_id;         // unique id in the current lattice.
-    int id;                 // vocab id. (maybe -1 for UNK)
-    float score;            // logprob of this sentencepiece.
-    float backtrace_score;  // backtrace info used in Viterbi.
-    Node *prev;             // best previous node on Viterbi path.
+    absl::string_view piece;  // Sentence piece representation.
+    uint32 pos;               // Unicode position in the sentence.
+    uint32 length;            // Unicode length, not UT8 byte.
+    uint32 node_id;           // unique id in the current lattice.
+    int id;                   // vocab id. (maybe -1 for UNK)
+    float score;              // logprob of this sentencepiece.
+    float backtrace_score;    // backtrace info used in Viterbi.
+    Node *prev;               // best previous node on Viterbi path.
 
     std::string DebugString() const;
   };
@@ -109,17 +110,26 @@ class Lattice {
   std::vector<const char *> surface_;
   std::vector<std::vector<Node *>> begin_nodes_;
   std::vector<std::vector<Node *>> end_nodes_;
-  std::vector<Node *> all_nodes_;
+  model::FreeList<Node> node_allocator_;
 };
 
-// Base class for Unigram Model.
-// We have base Model class because we will have different
-// implementations for training and testing.
-// Trie management part is shared by training and testing.
-class ModelBase : public ModelInterface {
+class Model : public ModelInterface {
  public:
-  ModelBase();
-  ~ModelBase() override;
+  explicit Model(const ModelProto &model_proto);
+  Model() {}
+  ~Model() override;
+
+  EncodeResult Encode(absl::string_view normalized) const override;
+
+  NBestEncodeResult NBestEncode(absl::string_view normalized,
+                                int nbest_size) const override;
+
+  EncodeResult SampleEncode(absl::string_view normalized,
+                            float theta) const override;
+
+  bool IsSampleEncodeAvailable() const override { return true; }
+
+  bool IsNBestEncodeAvailable() const override { return true; }
 
   // Returns the minimum score in sentence pieces.
   // min_score() - 10 is used for the cost of unknown sentence.
@@ -137,9 +147,24 @@ class ModelBase : public ModelInterface {
   // Returns a vocab id of |piece|.
   int PieceToId(absl::string_view piece) const override;
 
+  // Verifies if two outputs are equivalent by comparing their scores.
+  bool VerifyOutputsEquivalent(absl::string_view expected,
+                               absl::string_view actual) const override;
+
  protected:
   // Builds a Trie index.
   void BuildTrie(std::vector<std::pair<absl::string_view, int>> *pieces);
+
+  // The optimized Viterbi encode.
+  // Main differences from the original function:
+  // 1. Memorizes the best path at each postion so far,
+  // 2. No need to store the Lattice nodes,
+  // 3. Works in utf-8 directly,
+  // 4. Defines a new struct with fewer fields than Lattice,
+  // 5. Does not depend on `class Lattice` nor call `SetSentence()`,
+  // `PopulateNodes()`, or `Viterbi()`. It does everything in one function.
+  // For detailed explanations please see the comments inside the function body.
+  EncodeResult EncodeOptimized(absl::string_view normalized) const;
 
   float min_score_ = 0.0;
   float max_score_ = 0.0;
@@ -150,19 +175,6 @@ class ModelBase : public ModelInterface {
   int trie_results_size_;
 };
 
-// Unigram model class for decoding.
-class Model : public ModelBase {
- public:
-  explicit Model(const ModelProto &model_proto);
-  ~Model() override;
-
-  EncodeResult Encode(absl::string_view normalized) const override;
-
-  NBestEncodeResult NBestEncode(absl::string_view normalized,
-                                int nbest_size) const override;
-
-  EncodeResult SampleEncode(absl::string_view normalized, float theta) const override;
-};
 }  // namespace unigram
 }  // namespace sentencepiece
 #endif  // UNIGRAM_MODEL_H_

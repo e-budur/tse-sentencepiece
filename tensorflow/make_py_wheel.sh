@@ -17,7 +17,6 @@
 set -e  # exit immediately on error
 set -x  # display all commands
 
-PROTOBUF_VERSION=3.6.1
 CMAKE_VERSION=3.12.0
 
 run_docker() {
@@ -26,70 +25,64 @@ run_docker() {
   docker run --rm -ti --name tf_sentencepiece \
     -v `pwd`/../:/sentencepiece -w /sentencepiece/tensorflow \
     -td $1 /bin/bash
-  docker exec tf_sentencepiece bash -c "./make_py_wheel.sh native"
+  docker exec tf_sentencepiece bash -c "./make_py_wheel.sh native $2"
   docker stop tf_sentencepiece
 }
 
+build_tf_wrapper() {
+  pkg_name="==$1"
+
+  pip3 install tensorflow${pkg_name} --upgrade
+
+  TF_CFLAGS=( $(python3 -c 'import tensorflow as tf; print(" ".join(tf.sysconfig.get_compile_flags()))') )
+  TF_LFLAGS=( $(python3 -c 'import tensorflow as tf; print(" ".join(tf.sysconfig.get_link_flags()))') )
+  TF_VERSION=( $(python3 -c 'import tensorflow as tf; print(tf.__version__)') )
+
+  echo TF_CFLAGS=${TF_CFLAGS[@]}
+  echo TF_LFLAGS=${TF_LFLAGS[@]}
+  echo TF_VERSION=${TF_VERSION}
+
+  g++ -std=c++11 -shared \
+    -I../../src \
+    -D_USE_TF_STRING_VIEW \
+    -fPIC ${TF_CFLAGS[@]} -O2 \
+    -Wl,--whole-archive \
+    /usr/local/lib/libsentencepiece.a \
+    -Wl,--no-whole-archive \
+    sentencepiece_processor_ops.cc \
+    -o tf_sentencepiece/_sentencepiece_processor_ops.so.${TF_VERSION} \
+    ${TF_LFLAGS[@]}
+
+  strip tf_sentencepiece/_sentencepiece_processor_ops.so.${TF_VERSION}
+
+  python3 setup.py test
+}
+
 build() {
-  TRG=$1
   rm -fr build
   mkdir -p build
   cd build
-  
-  export PATH="/opt/python/cp27-cp27mu/bin:${PATH}"
 
-  # Install cmake
-  curl -L -O https://cmake.org/files/v3.12/cmake-${CMAKE_VERSION}.tar.gz
-  tar zxfv cmake-${CMAKE_VERSION}.tar.gz
-  cd cmake-${CMAKE_VERSION}
-  ./bootstrap
-  make -j4
-  make install
-  cd ..
-
-  # Install protobuf
-  curl -L -O https://github.com/google/protobuf/releases/download/v${PROTOBUF_VERSION}/protobuf-cpp-${PROTOBUF_VERSION}.tar.gz
-  tar zxfv protobuf-cpp-${PROTOBUF_VERSION}.tar.gz
-  cd protobuf-${PROTOBUF_VERSION}
-  ./configure --disable-shared --with-pic
-  make CXXFLAGS+="-std=c++11 -O3 -D_GLIBCXX_USE_CXX11_ABI=0" \
-    CFLAGS+="-std=c++11 -O3 -D_GLIBCXX_USE_CXX11_ABI=0" -j4
-  make install
-  cd ..
-
-  # Install sentencepiece
   cmake ../.. -DSPM_ENABLE_SHARED=OFF -DSPM_ENABLE_TENSORFLOW_SHARED=ON
   make -j4
   make install
   cd ..
 
-  # Builds _sentencepiece_processor_ops.so
-  pip install tensorflow
-  TF_CFLAGS="-I/opt/python/cp27-cp27mu/lib/python2.7/site-packages/tensorflow/include"
-  TF_LFLAGS="-L/opt/python/cp27-cp27mu/lib/python2.7/site-packages/tensorflow -ltensorflow_framework"
+  for v in $@; do
+    build_tf_wrapper $v
+  done
 
-  g++ -std=c++11 -shared \
-    -I../../src \
-    -fPIC ${TF_CFLAGS[@]} -O2 \
-    -D_GLIBCXX_USE_CXX11_ABI=0 \
-    -Wl,--whole-archive \
-    /usr/local/lib/libprotobuf.a \
-    /usr/local/lib/libsentencepiece.a \
-    -Wl,--no-whole-archive \
-    sentencepiece_processor_ops.cc \
-    -o tf_sentencepiece/_sentencepiece_processor_ops.so \
-    ${TF_LFLAGS[@]}
-  strip tf_sentencepiece/_sentencepiece_processor_ops.so
-
-  # Builds Python manylinux wheel package.
-  python setup.py bdist_wheel --universal --plat-name=manylinux1_x86_64
-  python setup.py sdist
-
+  python3 setup.py bdist_wheel --universal --plat-name=manylinux1_x86_64
+  python3 setup.py sdist
   rm -fr build tf_sentencepiece.egg-info
 }
 
 if [ "$1" = "native" ]; then
-  build
+  shift
+  build $@
 else
-  run_docker quay.io/pypa/manylinux1_x86_64
+# Do not support TF<=1.14 because API compatiblity issue is not fixed.
+# run_docker tensorflow/tensorflow:custom-op-ubuntu14 "1.13.1 1.13.2 1.14.0"
+  run_docker tensorflow/tensorflow:custom-op-ubuntu16 "1.15.0 1.15.2 2.0.0 2.0.1"
+  run_docker tensorflow/tensorflow:2.1.0-custom-op-ubuntu16 "2.1.0 2.2.0"
 fi

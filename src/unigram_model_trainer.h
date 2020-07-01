@@ -17,7 +17,6 @@
 
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -32,11 +31,12 @@ namespace unigram {
 
 using string_util::UnicodeText;
 
-class TrainerModel : public ModelBase {
+class TrainerModel : public Model {
  public:
   using SentencePieces = std::vector<std::pair<std::string, float>>;
 
-  TrainerModel() = delete;
+  TrainerModel() {}
+  TrainerModel(const ModelProto &model_proto) = delete;
   TrainerModel(const TrainerSpec &trainer_spec,
                const NormalizerSpec &normalizaiton_spec);
   ~TrainerModel() override;
@@ -49,37 +49,24 @@ class TrainerModel : public ModelBase {
   // The meta symbols, e.g., </s> are NOT included.
   void SetSentencePieces(SentencePieces &&sentencepieces);
 
-  int GetPieceSize() const override { return sentencepieces_.size(); }
-
-  float GetScore(int index) const override {
-    return sentencepieces_[index].second;
+  EncodeResult Encode(absl::string_view normalized) const override {
+    return {};
   }
-
-  std::string IdToPiece(int id) const override {
-    return sentencepieces_[id].first;
-  }
-
-  bool IsControl(int id) const override { return false; }
-
-  bool IsUnknown(int id) const override { return false; }
-
-  bool IsUnused(int id) const override { return false; }
-
-  bool IsUserDefined(int id) const override { return false; }
-
-  EncodeResult Encode(absl::string_view normalized) const override { return {}; }
 
  private:
   SentencePieces sentencepieces_;
   TrainerSpec trainer_spec_;
   NormalizerSpec normalizer_spec_;
+  ModelProto model_proto_data_;
 };
 
 class Trainer : public TrainerInterface {
  public:
   Trainer(const TrainerSpec &trainer_spec,
-          const NormalizerSpec &normalizer_spec)
-      : TrainerInterface::TrainerInterface(trainer_spec, normalizer_spec) {}
+          const NormalizerSpec &normalizer_spec,
+          const NormalizerSpec &denormalizer_spec)
+      : TrainerInterface::TrainerInterface(trainer_spec, normalizer_spec,
+                                           denormalizer_spec) {}
 
   util::Status Train() override;
 
@@ -88,6 +75,9 @@ class Trainer : public TrainerInterface {
 
   // Makes seed pieces from the training corpus.
   // The size of seed pieces is determined by seed_sentencepiece_size.
+  // node_int_type should be of integer type (int32 or int64),
+  // determined by train_extremely_large_corpus.
+  template <typename node_int_type>
   TrainerModel::SentencePieces MakeSeedSentencePieces() const;
 
   // Executes the E step of EM and returns expected count.

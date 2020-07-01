@@ -16,6 +16,7 @@
 #define NORMALIZER_NORMALIZER_H_
 
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,6 +29,26 @@
 
 namespace sentencepiece {
 namespace normalizer {
+
+// Given a list of strings, finds the longest string which is a
+// prefix of a query.
+class PrefixMatcher {
+ public:
+  // Initializes the PrefixMatcher with `dic`.
+  explicit PrefixMatcher(const std::set<absl::string_view> &dic);
+
+  // Finds the longest string in dic, which is a prefix of `w`.
+  // Returns the UTF8 byte length of matched string.
+  // `found` is set if a prefix match exists.
+  // If no entry is found, consumes one Unicode character.
+  int PrefixMatch(absl::string_view w, bool *found = nullptr) const;
+
+  // Replaces entries in `w` with `out`.
+  std::string GlobalReplace(absl::string_view w, absl::string_view out) const;
+
+ private:
+  std::unique_ptr<Darts::DoubleArray> trie_;
+};
 
 // Normalizer implements a simple text normalizer with
 // user-defined string-to-string rules and leftmost longest
@@ -44,7 +65,12 @@ class Normalizer {
   // Instantiates Normalizer with |spec|.
   // |spec| should not be deleted until Normalizer is destroyed.
   explicit Normalizer(const NormalizerSpec &spec);
+  Normalizer(const NormalizerSpec &spec, const TrainerSpec &trainer_Spec);
   virtual ~Normalizer();
+
+  virtual void SetPrefixMatcher(const PrefixMatcher *matcher) {
+    matcher_ = matcher;
+  }
 
   // Returns Status.
   // Normalizes function is valid only when status is OK.
@@ -59,7 +85,8 @@ class Normalizer {
   // - Adds a prefix space.
   // - Replaces a space with a meta symbol.
   // - Removing heading, tailing and other redundant spaces.
-  virtual util::Status Normalize(absl::string_view input, std::string *normalized,
+  virtual util::Status Normalize(absl::string_view input,
+                                 std::string *normalized,
                                  std::vector<size_t> *norm_to_orig) const;
 
   // Returns a normalized string without alignments.
@@ -70,6 +97,8 @@ class Normalizer {
 
  private:
   FRIEND_TEST(NormalizerTest, EncodeDecodePrecompiledCharsMapTest);
+
+  void Init();
 
   // Normalizes the prefix of |input| and returns the pair of
   // normalized prefix and length we must consume after
@@ -83,7 +112,8 @@ class Normalizer {
   //   output.append(p.first.data(), p.first.size());
   //   input.remove_prefix(p.second);
   // }
-  std::pair<absl::string_view, int> NormalizePrefix(absl::string_view input) const;
+  std::pair<absl::string_view, int> NormalizePrefix(
+      absl::string_view input) const;
 
   // Encodes trie_blob and normalized string and return compiled blob.
   static std::string EncodePrecompiledCharsMap(absl::string_view trie_blob,
@@ -107,6 +137,13 @@ class Normalizer {
 
   // Spec for normalization.
   const NormalizerSpec *spec_;
+
+  // Prefix matcher;
+  const PrefixMatcher *matcher_ = nullptr;
+
+  // Split hello world into "hello_" and "world_" instead of
+  // "_hello" and "_world".
+  const bool treat_whitespace_as_suffix_ = false;
 
   // Normalizer's status.
   util::Status status_;

@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.!
 
-#include "word_model.h"
 #include "util.h"
+#include "word_model.h"
 
 namespace sentencepiece {
 namespace word {
 
 Model::Model(const ModelProto &model_proto) {
   model_proto_ = &model_proto;
-  InitializePieces(false /* enable string matcher */);
+  InitializePieces();
 }
 
 Model::~Model() {}

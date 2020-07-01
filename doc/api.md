@@ -41,7 +41,7 @@ for (const int id : ids) {
 ```
 
 ## Detokenize text (postprocessing)
-Calls `SentencePieceProcessor::Decode` method to detokenize a sequence of pieces or ids into a text. Basically it is guaranteed that the detoknization is an inverse operation of Encode, i.e., `Decode(Encode(Normalize(input))) == Normalize(input)`.
+Calls `SentencePieceProcessor::Decode` method to detokenize a sequence of pieces or ids into a text. Basically it is guaranteed that the detokenization is an inverse operation of Encode, i.e., `Decode(Encode(Normalize(input))) == Normalize(input)`.
 
 ```C++
 std::vector<std::string> pieces = { "▁This", "▁is", "▁a", "▁", "te", "st", "." };   // sequence of pieces
@@ -67,7 +67,7 @@ processor.SampleEncode("This is a test.", &ids, -1, 0.2);
 SampleEncode has two sampling parameters, `nbest_size` and `alpha`, which correspond to `l` and `alpha` in the [original paper](https://arxiv.org/abs/1804.10959). When `nbest_size` is -1, one segmentation is sampled from all hypothesis with forward-filtering and backward sampling algorithm.
 
 ## Training
-Calls `SentencePieceTrainer::Train` function to train sentencepiece model. You can pass the same parameters of [spm_train](https://github.com/google/sentencepiece#train-sentencepiece-model) as a single stirng.
+Calls `SentencePieceTrainer::Train` function to train sentencepiece model. You can pass the same parameters of [spm_train](https://github.com/google/sentencepiece#train-sentencepiece-model) as a single string.
 
 ```C++
 #include <sentencepiece_trainer.h>

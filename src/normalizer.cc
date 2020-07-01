@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.!
 
-#include "normalizer.h"
-
 #include <utility>
 #include <vector>
+
 #include "common.h"
+#include "normalizer.h"
+#include "third_party/absl/memory/memory.h"
+#include "third_party/absl/strings/match.h"
 #include "third_party/absl/strings/string_view.h"
+#include "third_party/absl/strings/strip.h"
 #include "third_party/darts_clone/darts.h"
 #include "util.h"
 
@@ -26,9 +29,23 @@ namespace normalizer {
 
 constexpr int Normalizer::kMaxTrieResultsSize;
 
+Normalizer::Normalizer(const NormalizerSpec &spec,
+                       const TrainerSpec &trainer_spec)
+    : spec_(&spec),
+      treat_whitespace_as_suffix_(trainer_spec.treat_whitespace_as_suffix()),
+      status_(util::OkStatus()) {
+  Init();
+}
+
 Normalizer::Normalizer(const NormalizerSpec &spec)
     : spec_(&spec), status_(util::OkStatus()) {
-  absl::string_view index = spec.precompiled_charsmap();
+  Init();
+}
+
+Normalizer::~Normalizer() {}
+
+void Normalizer::Init() {
+  absl::string_view index = spec_->precompiled_charsmap();
   if (index.empty()) {
     LOG(INFO) << "precompiled_charsmap is empty. use identity normalization.";
   } else {
@@ -37,7 +54,7 @@ Normalizer::Normalizer(const NormalizerSpec &spec)
     if (!status_.ok()) return;
 
     // Reads the body of double array.
-    trie_ = port::MakeUnique<Darts::DoubleArray>();
+    trie_ = absl::make_unique<Darts::DoubleArray>();
 
     // The second arg of set_array is not the size of blob,
     // but the number of double array units.
@@ -47,8 +64,6 @@ Normalizer::Normalizer(const NormalizerSpec &spec)
     normalized_ = normalized.data();
   }
 }
-
-Normalizer::~Normalizer() {}
 
 util::Status Normalizer::Normalize(absl::string_view input,
                                    std::string *normalized,
@@ -90,11 +105,8 @@ util::Status Normalizer::Normalize(absl::string_view input,
   // if escape_whitespaces() is set (default = true).
   const absl::string_view kSpaceSymbol = "\xe2\x96\x81";
 
-  // Adds a space symbol as a prefix (default is true)
-  // With this prefix, "world" and "hello world" are converted into
-  // "_world" and "_hello_world", which help the trainer to extract
-  // "_world" as one symbol.
-  if (spec_->add_dummy_prefix()) {
+  // adds kSpaceSymbol to the current context.
+  auto add_ws = [this, &consumed, &normalized, &norm_to_orig, &kSpaceSymbol]() {
     if (spec_->escape_whitespaces()) {
       normalized->append(kSpaceSymbol.data(), kSpaceSymbol.size());
       for (size_t n = 0; n < kSpaceSymbol.size(); ++n) {
@@ -104,7 +116,13 @@ util::Status Normalizer::Normalize(absl::string_view input,
       normalized->append(" ");
       norm_to_orig->push_back(consumed);
     }
-  }
+  };
+
+  // Adds a space symbol as a prefix (default is true)
+  // With this prefix, "world" and "hello world" are converted into
+  // "_world" and "_hello_world", which help the trainer to extract
+  // "_world" as one symbol.
+  if (!treat_whitespace_as_suffix_ && spec_->add_dummy_prefix()) add_ws();
 
   bool is_prev_space = spec_->remove_extra_whitespaces();
   while (!input.empty()) {
@@ -113,7 +131,7 @@ util::Status Normalizer::Normalize(absl::string_view input,
 
     // Removes heading spaces in sentence piece,
     // if the previous sentence piece ends with whitespace.
-    while (is_prev_space && string_util::ConsumePrefix(&sp, " ")) {
+    while (is_prev_space && absl::ConsumePrefix(&sp, " ")) {
     }
 
     if (!sp.empty()) {
@@ -131,7 +149,7 @@ util::Status Normalizer::Normalize(absl::string_view input,
         }
       }
       // Checks whether the last character of sp is whitespace.
-      is_prev_space = string_util::EndsWith(sp, " ");
+      is_prev_space = absl::EndsWith(sp, " ");
     }
 
     consumed += p.second;
@@ -145,7 +163,7 @@ util::Status Normalizer::Normalize(absl::string_view input,
   if (spec_->remove_extra_whitespaces()) {
     const absl::string_view space =
         spec_->escape_whitespaces() ? kSpaceSymbol : " ";
-    while (string_util::EndsWith(*normalized, space)) {
+    while (absl::EndsWith(*normalized, space)) {
       const int length = normalized->size() - space.size();
       CHECK_GE_OR_RETURN(length, 0);
       consumed = (*norm_to_orig)[length];
@@ -153,6 +171,9 @@ util::Status Normalizer::Normalize(absl::string_view input,
       norm_to_orig->resize(length);
     }
   }
+
+  // Adds a space symbol as a suffix (default is false)
+  if (treat_whitespace_as_suffix_ && spec_->add_dummy_prefix()) add_ws();
 
   norm_to_orig->push_back(consumed);
 
@@ -164,7 +185,7 @@ util::Status Normalizer::Normalize(absl::string_view input,
 std::string Normalizer::Normalize(absl::string_view input) const {
   std::vector<size_t> norm_to_orig;
   std::string normalized;
-  Normalize(input, &normalized, &norm_to_orig);
+  Normalize(input, &normalized, &norm_to_orig).IgnoreError();
   return normalized;
 }
 
@@ -173,6 +194,12 @@ std::pair<absl::string_view, int> Normalizer::NormalizePrefix(
   std::pair<absl::string_view, int> result;
 
   if (input.empty()) return result;
+
+  if (matcher_ != nullptr) {
+    bool found = false;
+    const int mblen = matcher_->PrefixMatch(input, &found);
+    if (found) return std::make_pair(input.substr(0, mblen), mblen);
+  }
 
   size_t longest_length = 0;
   int longest_value = 0;
@@ -254,5 +281,56 @@ util::Status Normalizer::DecodePrecompiledCharsMap(
 
   return util::OkStatus();
 }
+
+PrefixMatcher::PrefixMatcher(const std::set<absl::string_view> &dic) {
+  if (dic.empty()) return;
+  std::vector<const char *> key;
+  key.reserve(dic.size());
+  for (const auto &it : dic) key.push_back(it.data());
+  trie_ = absl::make_unique<Darts::DoubleArray>();
+  CHECK_EQ(0, trie_->build(key.size(), const_cast<char **>(&key[0]), nullptr,
+                           nullptr));
+}
+
+int PrefixMatcher::PrefixMatch(absl::string_view w, bool *found) const {
+  if (trie_ == nullptr) {
+    if (found) *found = false;
+    return std::min<int>(w.size(), string_util::OneCharLen(w.data()));
+  }
+
+  constexpr int kResultSize = 64;
+  Darts::DoubleArray::result_pair_type trie_results[kResultSize];
+  const int num_nodes =
+      trie_->commonPrefixSearch(w.data(), trie_results, kResultSize, w.size());
+
+  if (found) *found = (num_nodes > 0);
+  if (num_nodes == 0) {
+    return std::min<int>(w.size(), string_util::OneCharLen(w.data()));
+  }
+
+  int mblen = 0;
+  for (int i = 0; i < num_nodes; ++i) {
+    mblen = std::max<int>(trie_results[i].length, mblen);
+  }
+
+  return mblen;
+}
+
+std::string PrefixMatcher::GlobalReplace(absl::string_view w,
+                                         absl::string_view out) const {
+  std::string result;
+  while (!w.empty()) {
+    bool found = false;
+    const int mblen = PrefixMatch(w, &found);
+    if (found) {
+      result.append(out.data(), out.size());
+    } else {
+      result.append(w.data(), mblen);
+    }
+    w.remove_prefix(mblen);
+  }
+  return result;
+}
+
 }  // namespace normalizer
 }  // namespace sentencepiece

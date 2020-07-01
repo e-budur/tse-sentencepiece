@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.!
 
-#include "unigram_model.h"
-
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -23,12 +21,21 @@
 #include <utility>
 #include <vector>
 
+#include "third_party/absl/memory/memory.h"
+#include "third_party/absl/strings/str_split.h"
 #include "third_party/absl/strings/string_view.h"
+#include "unigram_model.h"
 #include "util.h"
 
 namespace sentencepiece {
 namespace unigram {
 namespace {
+
+// Size of nodes pre-allocated in Lattice.
+constexpr size_t kPreallocateLatticeNodeSize = 1024;
+
+constexpr float kUnkPenalty = 10.0;
+constexpr float kEpsilon = 1e-7;
 
 // Returns log(exp(x) + exp(y)).
 // if init_mode is true, returns log(exp(y)) == y.
@@ -45,13 +52,13 @@ inline float LogSumExp(float x, float y, bool init_mode) {
   if (vmax > vmin + kMinusLogEpsilon) {
     return vmax;
   } else {
-    return vmax + log(exp(vmin - vmax) + 1.0);
+    return vmax + log(std::exp(static_cast<double>(vmin - vmax)) + 1.0);
   }
 }
 }  // namespace
 
-Lattice::Lattice() {}
-Lattice::~Lattice() { Clear(); }
+Lattice::Lattice() : node_allocator_(kPreallocateLatticeNodeSize) {}
+Lattice::~Lattice() {}
 
 const std::vector<Lattice::Node *> &Lattice::begin_nodes(int pos) const {
   return begin_nodes_[pos];
@@ -77,10 +84,8 @@ Lattice::Node *Lattice::bos_node() const { return end_nodes_[0][0]; }
 Lattice::Node *Lattice::eos_node() const { return begin_nodes_[size()][0]; }
 
 Lattice::Node *Lattice::NewNode() {
-  Node *node = new Node;
-  memset(node, 0, sizeof(*node));
-  node->node_id = all_nodes_.size();
-  all_nodes_.push_back(node);
+  Node *node = node_allocator_.Allocate();
+  node->node_id = node_allocator_.size() - 1;
   return node;
 }
 
@@ -89,14 +94,14 @@ void Lattice::Clear() {
   end_nodes_.clear();
   sentence_ = absl::string_view("");
   surface_.clear();
-  port::STLDeleteElements(&all_nodes_);
-  all_nodes_.clear();
+  node_allocator_.Free();
 }
 
 void Lattice::SetSentence(absl::string_view sentence) {
   Clear();
 
   sentence_ = sentence;
+  surface_.reserve(sentence.size() + 1);
 
   while (!sentence.empty()) {
     const int mblen = std::min<int>(string_util::OneCharLen(sentence.data()),
@@ -110,9 +115,10 @@ void Lattice::SetSentence(absl::string_view sentence) {
   begin_nodes_.resize(len + 1);
   end_nodes_.resize(len + 1);
 
+  constexpr size_t kReservedNodeSize = 16;
   for (int i = 0; i <= len; ++i) {
-    begin_nodes_[i].reserve(16);
-    end_nodes_[i].reserve(16);
+    begin_nodes_[i].reserve(kReservedNodeSize);
+    end_nodes_[i].reserve(kReservedNodeSize);
   }
 
   Node *bos = NewNode();
@@ -183,8 +189,8 @@ float Lattice::PopulateMarginal(float freq,
 
   // alpha and beta (accumulative log prob) in Forward Backward.
   // the index of alpha/beta is Node::node_id.
-  std::vector<float> alpha(all_nodes_.size(), 0.0);
-  std::vector<float> beta(all_nodes_.size(), 0.0);
+  std::vector<float> alpha(node_allocator_.size(), 0.0);
+  std::vector<float> beta(node_allocator_.size(), 0.0);
 
   for (int pos = 0; pos <= len; ++pos) {
     for (Node *rnode : begin_nodes_[pos]) {
@@ -211,8 +217,10 @@ float Lattice::PopulateMarginal(float freq,
     for (Node *node : begin_nodes_[pos]) {
       if (node->id >= 0) {
         // the index of |expected| is a Node::id, which is a vocabulary id.
-        (*expected)[node->id] += freq * exp(alpha[node->node_id] + node->score +
-                                            beta[node->node_id] - Z);
+        (*expected)[node->id] +=
+            freq *
+            std::exp(static_cast<double>(alpha[node->node_id] + node->score +
+                                         beta[node->node_id] - Z));
       }
     }
   }
@@ -256,19 +264,13 @@ std::vector<std::vector<Lattice::Node *>> Lattice::NBest(size_t nbest_size) {
 
   using Agenda = std::priority_queue<Hypothesis *, std::vector<Hypothesis *>,
                                      HypothesisComparator>;
+  constexpr size_t kPreallocatedHypothesisSize = 512;
+  model::FreeList<Hypothesis> hypothesis_allocator(kPreallocatedHypothesisSize);
 
   Agenda agenda;
-  std::vector<Hypothesis *> allocated;
   std::vector<std::vector<Node *>> results;
 
-  auto NewHypothesis = [&allocated]() {
-    Hypothesis *h = new Hypothesis;
-    memset(h, 0, sizeof(*h));
-    allocated.push_back(h);
-    return h;
-  };
-
-  auto *eos = NewHypothesis();
+  auto *eos = hypothesis_allocator.Allocate();
   eos->node = eos_node();
   eos->next = nullptr;
   eos->fx = eos->node->score;
@@ -297,7 +299,7 @@ std::vector<std::vector<Lattice::Node *>> Lattice::NBest(size_t nbest_size) {
 
     // Expands new node ending at node->pos
     for (Node *lnode : end_nodes(node->pos)) {
-      auto *hyp = NewHypothesis();
+      auto *hyp = hypothesis_allocator.Allocate();
       hyp->node = lnode;
       hyp->gx = lnode->score + top->gx;  // just adds node->score
       hyp->fx =
@@ -324,7 +326,6 @@ std::vector<std::vector<Lattice::Node *>> Lattice::NBest(size_t nbest_size) {
     }
   }
 
-  port::STLDeleteElements(&allocated);
   return results;
 }
 
@@ -332,7 +333,7 @@ std::vector<Lattice::Node *> Lattice::Sample(float theta) {
   const int len = size();
   if (len == 0) return {};
 
-  std::vector<float> alpha(all_nodes_.size(), 0.0);
+  std::vector<float> alpha(node_allocator_.size(), 0.0);
 
   for (int pos = 0; pos <= len; ++pos) {
     for (Node *rnode : begin_nodes_[pos]) {
@@ -354,7 +355,8 @@ std::vector<Lattice::Node *> Lattice::Sample(float theta) {
   while (true) {
     probs.clear();
     for (const Node *lnode : end_nodes_[node->pos]) {
-      probs.push_back(exp(alpha[lnode->node_id] + theta * lnode->score - Z));
+      probs.push_back(std::exp(static_cast<double>(alpha[lnode->node_id] +
+                                                   theta * lnode->score - Z)));
     }
     std::discrete_distribution<int> dist(probs.begin(), probs.end());
     node = end_nodes_[node->pos][dist(*mt)];
@@ -368,21 +370,16 @@ std::vector<Lattice::Node *> Lattice::Sample(float theta) {
   return results;
 }
 
-ModelBase::ModelBase() {}
-ModelBase::~ModelBase() {}
+// Model::Model() {}
+// Model::~Model() {}
 
-void ModelBase::PopulateNodes(Lattice *lattice) const {
-  auto GetCharsLength = [](const char *begin, int len) {
-    const char *end = begin + len;
-    int result = 0;
-    while (begin < end) {
-      begin += std::min<int>(string_util::OneCharLen(begin), end - begin);
-      ++result;
-    }
-    return result;
+void Model::PopulateNodes(Lattice *lattice) const {
+  auto get_chars_length = [&lattice](int begin_pos, const char *end) {
+    int pos = begin_pos;
+    while (lattice->surface(pos) < end) ++pos;
+    return pos - begin_pos;
   };
 
-  constexpr float kUnkPenalty = 10.0;
   const float unk_score = min_score() - kUnkPenalty;
 
   const int len = lattice->size();
@@ -405,14 +402,15 @@ void ModelBase::PopulateNodes(Lattice *lattice) const {
 
     // Inserts pieces to the lattice.
     for (size_t k = 0; k < num_nodes; ++k) {
-      const int length = GetCharsLength(begin, trie_results[k].length);
+      const int length =
+          get_chars_length(begin_pos, begin + trie_results[k].length);
       const int id = trie_results[k].value;
-      if (IsUnused(id)) continue;
+      if (IsUnusedInlined(id)) continue;
       Lattice::Node *node = lattice->Insert(begin_pos, length);
       node->id = id;  // the value of Trie stores vocab_id.
       // User defined symbol receives extra bonus to always be selected.
-      node->score =
-          IsUserDefined(id) ? (length * max_score_ + 1.0) : GetScore(id);
+      node->score = IsUserDefinedInlined(id) ? (length * max_score_ - 0.1)
+                                             : GetScoreInlined(id);
       if (!has_single_node && node->length == 1) {
         has_single_node = true;
       }
@@ -426,18 +424,17 @@ void ModelBase::PopulateNodes(Lattice *lattice) const {
   }
 }
 
-int ModelBase::PieceToId(absl::string_view piece) const {
+int Model::PieceToId(absl::string_view piece) const {
   auto it = reserved_id_map_.find(piece);
   if (it != reserved_id_map_.end()) {
     return it->second;
   }
   int id = 0;
-  trie_->exactMatchSearch(piece.data(), id);
+  trie_->exactMatchSearch(piece.data(), id, piece.size());
   return id == -1 ? unk_id_ : id;
 }
 
-void ModelBase::BuildTrie(
-    std::vector<std::pair<absl::string_view, int>> *pieces) {
+void Model::BuildTrie(std::vector<std::pair<absl::string_view, int>> *pieces) {
   if (!status().ok()) return;
 
   if (pieces->empty()) {
@@ -457,7 +454,7 @@ void ModelBase::BuildTrie(
     value[i] = (*pieces)[i].second;      // vocab_id
   }
 
-  trie_ = port::MakeUnique<Darts::DoubleArray>();
+  trie_ = absl::make_unique<Darts::DoubleArray>();
   if (trie_->build(key.size(), const_cast<char **>(&key[0]), nullptr,
                    &value[0]) != 0) {
     status_ = util::InternalError("cannot build double-array.");
@@ -484,7 +481,7 @@ void ModelBase::BuildTrie(
 Model::Model(const ModelProto &model_proto) {
   model_proto_ = &model_proto;
 
-  InitializePieces(false /* enable prefix matcher */);
+  InitializePieces();
 
   min_score_ = FLT_MAX;
   max_score_ = FLT_MIN;
@@ -504,6 +501,10 @@ Model::Model(const ModelProto &model_proto) {
 Model::~Model() {}
 
 EncodeResult Model::Encode(absl::string_view normalized) const {
+  if (encoder_version_ == EncoderVersion::kOptimized) {
+    return EncodeOptimized(normalized);
+  }
+
   if (!status().ok() || normalized.empty()) {
     return {};
   }
@@ -564,5 +565,169 @@ EncodeResult Model::SampleEncode(absl::string_view normalized,
   return results;
 }
 
+bool Model::VerifyOutputsEquivalent(absl::string_view expected,
+                                    absl::string_view actual) const {
+  auto compute_unigram_model_score =
+      [this](std::vector<absl::string_view> output_pieces) {
+        float total_score = 0;
+        const float unk_score = min_score() - kUnkPenalty;
+        for (const auto p : output_pieces) {
+          const auto id = PieceToId(p);
+          if (id == unk_id_) {
+            total_score += unk_score;
+          } else {
+            const int length = p.size();
+            total_score += IsUserDefinedInlined(id)
+                               ? (length * max_score_ - 0.1)
+                               : GetScoreInlined(id);
+          }
+        }
+        return total_score;
+      };
+  const auto expected_score =
+      compute_unigram_model_score(absl::StrSplit(expected, ' '));
+  const auto actual_score =
+      compute_unigram_model_score(absl::StrSplit(actual, ' '));
+  if (std::abs(expected_score - actual_score) > kEpsilon) {
+    LOG(WARNING) << "Two sentence piece sequences are not equivalent! Left: "
+                 << expected << ", Score: " << expected_score
+                 << ". Right: " << actual << ", Score: " << actual_score << ".";
+    return false;
+  }
+  return true;
+}
+
+EncodeResult Model::EncodeOptimized(absl::string_view normalized) const {
+  // An optimized Viterbi algorithm for unigram language models. Benchmarking
+  // results show that it generates almost identical outputs and achieves 2.1x
+  // speedup on average for 102 languages compared to the original
+  // implementation. It's based on the following three ideas:
+  //
+  // 1. Because it uses the *unigram* model:
+  //     best_score(x1, x2, …, xt) = best_score(x1, x2, …, x{t-1}) + score(xt)
+  // Deciding the best path (and score) can be decoupled into two isolated
+  // terms: (a) the best path ended before the last token `best_score(x1, x2, …,
+  // x{t-1})`, and (b) the last token and its `score(xt)`. The two terms are
+  // not related to each other at all.
+  //
+  // Therefore, we can compute once and store the *best_path ending at
+  // each character position*. In this way, when we know best_path_ends_at[M],
+  // we can reuse it to compute all the best_path_ends_at_[...] where the last
+  // token starts at the same character position M.
+  //
+  // This improves the time complexity from O(n*k*k) to O(n*k) because it
+  // eliminates the extra loop of recomputing the best path ending at the same
+  // position, where n is the input length and k is the maximum number of tokens
+  // that can be recognized starting at each position.
+  //
+  // 2. Again, because it uses the *unigram* model, we don’t need to actually
+  // store the lattice nodes. We still recognize all the tokens and lattice
+  // nodes from the input, but along identifying them, we use and discard them
+  // on the fly. There is no need to actually store them for best path Viterbi
+  // decoding. The only thing we need to store is the best_path ending at
+  // each character position.
+  //
+  // This improvement reduces the things needed to store in memory from O(n*k)
+  // to O(n), where n is the input length and k is the maximum number of tokens
+  // that can be recognized starting at each position.
+  //
+  // It also avoids the need of dynamic-size lattice node pool, because the
+  // number of things to store is fixed as n.
+  //
+  // 3. SentencePiece is designed to work with unicode, taking utf-8 encoding
+  // inputs. In the original implementation, the lattice positions are based on
+  // unicode positions. A mapping from unicode position to the utf-8 position is
+  // maintained to recover the utf-8 string piece.
+  //
+  // We found that it is sufficient and beneficial to directly work with utf-8
+  // positions:
+  //
+  // Firstly, it saves the conversion and mapping between unicode positions and
+  // utf-8 positions.
+  //
+  // Secondly, it reduces the number of fields we need to maintain in the
+  // node/path structure. Specifically, there are 8 fields defined in
+  // `Lattice::Node` used by the original encoder, but here in the optimized
+  // encoder we only need to define 3 fields in `BestPathNode`.
+
+  if (!status().ok() || normalized.empty()) {
+    return {};
+  }
+  // Represents the last node of the best path.
+  struct BestPathNode {
+    int id = -1;  // The vocab id. (maybe -1 for UNK)
+    float best_path_score =
+        0;  // The total score of the best path ending at this node.
+    int starts_at =
+        -1;  // The starting position (in utf-8) of this node. The entire best
+             // path can be constructed by backtracking along this link.
+  };
+  const int size = normalized.size();
+  const float unk_score = min_score() - kUnkPenalty;
+  // The ends are exclusive.
+  std::vector<BestPathNode> best_path_ends_at(size + 1);
+  // Generate lattice on-the-fly (not stored) and update best_path_ends_at.
+  int starts_at = 0;
+  while (starts_at < size) {
+    std::size_t node_pos = 0;
+    std::size_t key_pos = starts_at;
+    const auto best_path_score_till_here =
+        best_path_ends_at[starts_at].best_path_score;
+    bool has_single_node = false;
+    const int mblen =
+        std::min<int>(string_util::OneCharLen(normalized.data() + starts_at),
+                      size - starts_at);
+    while (key_pos < size) {
+      const int ret =
+          trie_->traverse(normalized.data(), node_pos, key_pos, key_pos + 1);
+      if (ret == -2) break;
+      if (ret >= 0) {
+        if (IsUnusedInlined(ret)) continue;
+        // Update the best path node.
+        auto &target_node = best_path_ends_at[key_pos];
+        const auto length = (key_pos - starts_at);
+        // User defined symbol receives extra bonus to always be selected.
+        const auto score = IsUserDefinedInlined(ret)
+                               ? (length * max_score_ - 0.1)
+                               : GetScoreInlined(ret);
+        const auto candidate_best_path_score =
+            score + best_path_score_till_here;
+        if (target_node.starts_at == -1 ||
+            candidate_best_path_score > target_node.best_path_score) {
+          target_node.best_path_score = candidate_best_path_score;
+          target_node.starts_at = starts_at;
+          target_node.id = ret;
+        }
+        if (!has_single_node && length == mblen) {
+          has_single_node = true;
+        }
+      }
+    }
+    if (!has_single_node) {
+      auto &target_node = best_path_ends_at[starts_at + mblen];
+      const auto candidate_best_path_score =
+          unk_score + best_path_score_till_here;
+      if (target_node.starts_at == -1 ||
+          candidate_best_path_score > target_node.best_path_score) {
+        target_node.best_path_score = candidate_best_path_score;
+        target_node.starts_at = starts_at;
+        target_node.id = unk_id_;
+      }
+    }
+    // Move by one unicode character.
+    starts_at += mblen;
+  }
+  // Backtrack to identify the best path.
+  EncodeResult results;
+  int ends_at = size;
+  while (ends_at > 0) {
+    const auto &node = best_path_ends_at[ends_at];
+    results.emplace_back(
+        normalized.substr(node.starts_at, ends_at - node.starts_at), node.id);
+    ends_at = node.starts_at;
+  }
+  std::reverse(results.begin(), results.end());
+  return results;
+}
 }  // namespace unigram
 }  // namespace sentencepiece

@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.!
 
-#include "bpe_model.h"
-
 #include <functional>
 #include <memory>
 #include <queue>
-#include <unordered_map>
+#include <random>
 #include <utility>
 #include <vector>
+
+#include "bpe_model.h"
+#include "freelist.h"
+#include "third_party/absl/container/flat_hash_map.h"
 #include "util.h"
 
 namespace sentencepiece {
@@ -27,13 +29,13 @@ namespace bpe {
 
 Model::Model(const ModelProto &model_proto) {
   model_proto_ = &model_proto;
-  InitializePieces(true /* use prefix matcher */);
+  InitializePieces();
 }
 
 Model::~Model() {}
 
-std::vector<std::pair<absl::string_view, int>> Model::Encode(
-    absl::string_view normalized) const {
+std::vector<std::pair<absl::string_view, int>> Model::SampleEncode(
+    absl::string_view normalized, float alpha) const {
   if (!status().ok() || normalized.empty()) {
     return {};
   }
@@ -68,14 +70,18 @@ std::vector<std::pair<absl::string_view, int>> Model::Encode(
 
   // Reverse merge rules.
   // key: merged symbol, value: pair of original symbols.
-  std::unordered_map<absl::string_view,
-                     std::pair<absl::string_view, absl::string_view>,
-                     string_util::string_view_hash>
+  absl::flat_hash_map<absl::string_view,
+                      std::pair<absl::string_view, absl::string_view>,
+                      string_util::string_view_hash>
       rev_merge;
 
+  // Pre-allocates SymbolPair for efficiency.
+  constexpr size_t kPreallocateSymbolPairSize = 256;
+  model::FreeList<SymbolPair> symbol_pair_allocator(kPreallocateSymbolPairSize);
+
   // Lookup new symbol pair at [left, right] and inserts it to agenda.
-  auto MaybeAddNewSymbolPair = [this, &symbols, &agenda, &rev_merge](
-                                   int left, int right) {
+  auto MaybeAddNewSymbolPair = [this, &symbol_pair_allocator, &symbols, &agenda,
+                                &rev_merge](int left, int right) {
     if (left == -1 || right == -1 || symbols[left].freeze ||
         symbols[right].freeze)
       return;
@@ -86,7 +92,7 @@ std::vector<std::pair<absl::string_view, int>> Model::Encode(
     if (it == pieces_.end()) {
       return;
     }
-    auto *h = new SymbolPair;
+    auto *h = symbol_pair_allocator.Allocate();
     h->left = left;
     h->right = right;
     h->score = GetScore(it->second);
@@ -94,7 +100,7 @@ std::vector<std::pair<absl::string_view, int>> Model::Encode(
     agenda.push(h);
 
     // Makes `rev_merge` for resegmentation.
-    if (IsUnused(it->second)) {
+    if (IsUnusedInlined(it->second)) {
       rev_merge[piece] =
           std::make_pair(symbols[left].piece, symbols[right].piece);
     }
@@ -122,9 +128,18 @@ std::vector<std::pair<absl::string_view, int>> Model::Encode(
     MaybeAddNewSymbolPair(i - 1, i);
   }
 
+  // BPE-dropout: https://arxiv.org/pdf/1910.13267.pdf
+  std::mt19937 *rand_gen = nullptr;
+  auto skip_merge = [&]() {
+    if (alpha <= 0.0) return false;
+    if (rand_gen == nullptr) rand_gen = random::GetRandomGenerator();
+    std::uniform_real_distribution<> gen(0.0, 1.0);
+    return gen(*rand_gen) < alpha;
+  };
+
   // Main loop.
   while (!agenda.empty()) {
-    std::unique_ptr<SymbolPair> top(agenda.top());
+    SymbolPair *top = agenda.top();
     agenda.pop();
 
     // `top` is no longer available.
@@ -133,6 +148,11 @@ std::vector<std::pair<absl::string_view, int>> Model::Encode(
             top->size) {
       continue;
     }
+
+    // Note that orignal BPE-dropout paper assumes that all merged symbols are
+    // pre computed, but here we randomly skip merge opration inside this loop.
+    // This implemenation is theoretically equivalent to the original one.
+    if (skip_merge()) continue;
 
     // Replaces symbols with `top` rule.
     symbols[top->left].piece = absl::string_view(
@@ -155,7 +175,7 @@ std::vector<std::pair<absl::string_view, int>> Model::Encode(
   resegment = [this, &resegment, &rev_merge](absl::string_view w,
                                              EncodeResult *output) -> void {
     const int id = PieceToId(w);
-    if (id == -1 || !IsUnused(id)) {
+    if (id == -1 || !IsUnusedInlined(id)) {
       output->emplace_back(w, id);
       return;
     }
